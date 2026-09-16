@@ -17,17 +17,22 @@ $ProtocUrl = 'https://github.com/protocolbuffers/protobuf/releases/download/v31.
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Evidence = "C:\n16e\$stamp"
-$CargoHome = 'C:\n16c'
 $CargoTarget = 'C:\n16o'
-$ProtocRoot = 'C:\n16p'
-$ProtocZip = 'C:\n16p.zip'
+$ProtocRoot = Join-Path $env:TEMP 'n16p'
+$ProtocZip = Join-Path $env:TEMP 'n16p.zip'
+$DefaultCargoHome = Join-Path $env:USERPROFILE '.cargo'
+$DefaultRustupHome = Join-Path $env:USERPROFILE '.rustup'
+
+# The local runner deliberately does not redirect CARGO_HOME.  Rustup/cargo must
+# use the user's existing installation under %USERPROFILE%\.cargo / .rustup.
+if ($env:CARGO_HOME) {
+    throw "CARGO_HOME must be unset for this local recheck; current value: $env:CARGO_HOME"
+}
 
 New-Item -ItemType Directory -Force -Path $Evidence | Out-Null
-New-Item -ItemType Directory -Force -Path $CargoHome | Out-Null
 if (Test-Path $CargoTarget) { Remove-Item -Recurse -Force $CargoTarget }
 New-Item -ItemType Directory -Force -Path $CargoTarget | Out-Null
 
-$env:CARGO_HOME = $CargoHome
 $env:CARGO_TARGET_DIR = $CargoTarget
 $env:CARGO_NET_GIT_FETCH_WITH_CLI = 'true'
 $env:CARGO_TERM_COLOR = 'never'
@@ -57,13 +62,23 @@ if ($before.Count -ne 0) {
     'match=true'
 ) | Set-Content -Path (Join-Path $Evidence 'commit.txt') -Encoding ASCII
 
+$rustupCmd = Get-Command rustup -ErrorAction Stop
+$rustcCmd = Get-Command rustc -ErrorAction Stop
+$cargoCmd = Get-Command cargo -ErrorAction Stop
 @(
     "computer_name=$env:COMPUTERNAME"
     "os_version=$([Environment]::OSVersion.VersionString)"
     "powershell=$($PSVersionTable.PSVersion)"
     "checkout=$Checkout"
-    "cargo_home=$CargoHome"
+    "cargo_home_process=$env:CARGO_HOME"
+    "cargo_home_default=$DefaultCargoHome"
+    "rustup_home_process=$env:RUSTUP_HOME"
+    "rustup_home_default=$DefaultRustupHome"
+    "rustup_command=$($rustupCmd.Source)"
+    "rustc_command=$($rustcCmd.Source)"
+    "cargo_command=$($cargoCmd.Source)"
     "cargo_target_dir=$CargoTarget"
+    "protoc_root=$ProtocRoot"
     "evidence=$Evidence"
 ) | Set-Content -Path (Join-Path $Evidence 'environment.txt') -Encoding UTF8
 try {
@@ -75,10 +90,15 @@ cmd.exe /c ver 2>&1 | Add-Content -Path (Join-Path $Evidence 'environment.txt') 
 
 git --version 2>&1 | Set-Content -Path (Join-Path $Evidence 'git_version.txt') -Encoding UTF8
 python --version 2>&1 | Set-Content -Path (Join-Path $Evidence 'python_version.txt') -Encoding UTF8
+if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+    Copy-Item $PSCommandPath (Join-Path $Evidence 'RUN_LOCAL_WINDOWS_R5_RECHECK.ps1')
+    $runnerHash = (Get-FileHash $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$runnerHash  RUN_LOCAL_WINDOWS_R5_RECHECK.ps1" | Set-Content -Path (Join-Path $Evidence 'runner_sha256.txt') -Encoding ASCII
+}
 
 Write-Host '[1/7] Downloading exact R5 witness bytes...'
 $snippet = Join-Path $Evidence 'test_snippet.rs'
-Invoke-WebRequest -Uri $SnippetUrl -OutFile $snippet
+Invoke-WebRequest -UseBasicParsing -Uri $SnippetUrl -OutFile $snippet
 $snippetHash = (Get-FileHash $snippet -Algorithm SHA256).Hash.ToLowerInvariant()
 "$snippetHash  test_snippet.rs" | Set-Content -Path (Join-Path $Evidence 'test_snippet_sha256.txt') -Encoding ASCII
 if ($snippetHash -ne $ExpectedSnippetSha256) { throw "R5 snippet SHA-256 mismatch: $snippetHash" }
@@ -86,7 +106,7 @@ if ($snippetHash -ne $ExpectedSnippetSha256) { throw "R5 snippet SHA-256 mismatc
 Write-Host '[2/7] Installing/verifying pinned protoc 31.1...'
 if (Test-Path $ProtocRoot) { Remove-Item -Recurse -Force $ProtocRoot }
 if (Test-Path $ProtocZip) { Remove-Item -Force $ProtocZip }
-Invoke-WebRequest -Uri $ProtocUrl -OutFile $ProtocZip
+Invoke-WebRequest -UseBasicParsing -Uri $ProtocUrl -OutFile $ProtocZip
 $protocArchiveHash = (Get-FileHash $ProtocZip -Algorithm SHA256).Hash.ToLowerInvariant()
 @(
     "url=$ProtocUrl"
@@ -102,16 +122,21 @@ $protocVersion = (& $protocExe --version 2>&1 | Out-String).Trim()
 $protocVersion | Set-Content -Path (Join-Path $Evidence 'protoc_version.txt') -Encoding ASCII
 if ($protocVersion -ne 'libprotoc 31.1') { throw "unexpected protoc version: $protocVersion" }
 
-Write-Host '[3/7] Installing/verifying Rust 1.95.0...'
-rustup toolchain install $RustToolchain --profile minimal
-if ($LASTEXITCODE -ne 0) { throw 'rustup toolchain install failed' }
-rustc "+$RustToolchain" --version 2>&1 | Set-Content -Path (Join-Path $Evidence 'rustc_version.txt') -Encoding UTF8
-cargo "+$RustToolchain" --version 2>&1 | Set-Content -Path (Join-Path $Evidence 'cargo_version.txt') -Encoding UTF8
-rustup show 2>&1 | Set-Content -Path (Join-Path $Evidence 'rustup_show.txt') -Encoding UTF8
-$rustc = (Get-Content (Join-Path $Evidence 'rustc_version.txt') -Raw).Trim()
-$cargo = (Get-Content (Join-Path $Evidence 'cargo_version.txt') -Raw).Trim()
-if ($rustc -notmatch '^rustc 1\.95\.0 ') { throw "wrong rustc: $rustc" }
-if ($cargo -notmatch '^cargo 1\.95\.0 ') { throw "wrong cargo: $cargo" }
+Write-Host '[3/7] Verifying existing Rust 1.95.0 toolchain...'
+$rustcOut = (& rustc "+$RustToolchain" --version 2>&1 | Out-String).Trim()
+$rustcStatus = $LASTEXITCODE
+$rustcOut | Set-Content -Path (Join-Path $Evidence 'rustc_version.txt') -Encoding UTF8
+if ($rustcStatus -ne 0) { throw "rustc +$RustToolchain verification failed: $rustcOut" }
+$cargoOut = (& cargo "+$RustToolchain" --version 2>&1 | Out-String).Trim()
+$cargoStatusVersion = $LASTEXITCODE
+$cargoOut | Set-Content -Path (Join-Path $Evidence 'cargo_version.txt') -Encoding UTF8
+if ($cargoStatusVersion -ne 0) { throw "cargo +$RustToolchain verification failed: $cargoOut" }
+$rustupOut = (& rustup show 2>&1 | Out-String).Trim()
+$rustupStatus = $LASTEXITCODE
+$rustupOut | Set-Content -Path (Join-Path $Evidence 'rustup_show.txt') -Encoding UTF8
+if ($rustupStatus -ne 0) { throw "rustup show failed: $rustupOut" }
+if ($rustcOut -notmatch '^rustc 1\.95\.0 ') { throw "wrong rustc: $rustcOut" }
+if ($cargoOut -notmatch '^cargo 1\.95\.0 ') { throw "wrong cargo: $cargoOut" }
 
 Write-Host '[4/7] Verifying MSVC x64 build environment...'
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -166,7 +191,7 @@ Write-Host '[6/7] Running exact native R5 test...'
 $command = "cargo +$RustToolchain -vv test --locked -p attestation-service --lib $TestName -- --nocapture"
 $command | Set-Content -Path (Join-Path $Evidence 'cargo_command.txt') -Encoding ASCII
 $log = Join-Path $Evidence 'cargo_test.log'
-$cmdLine = "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set PATH=$protocBin;%PATH% && set CARGO_HOME=$CargoHome && set CARGO_TARGET_DIR=$CargoTarget && set CARGO_NET_GIT_FETCH_WITH_CLI=true && cd /d `"$Checkout`" && $command > `"$log`" 2>&1"
+$cmdLine = "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set `"PATH=$protocBin;%PATH%`" && set `"CARGO_TARGET_DIR=$CargoTarget`" && set `"CARGO_NET_GIT_FETCH_WITH_CLI=true`" && cd /d `"$Checkout`" && $command > `"$log`" 2>&1"
 & $env:ComSpec /d /c $cmdLine
 $cargoStatus = $LASTEXITCODE
 "$cargoStatus" | Set-Content -Path (Join-Path $Evidence 'exit_code.txt') -Encoding ASCII
