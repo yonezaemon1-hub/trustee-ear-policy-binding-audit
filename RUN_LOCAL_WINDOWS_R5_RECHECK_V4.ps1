@@ -14,8 +14,8 @@ $BaseCommit = '6be9b7936cf3d32dd502c9e7e779736d44bcfb55'
 $BaseUrl = "https://raw.githubusercontent.com/yonezaemon1-hub/trustee-ear-policy-binding-audit/$BaseCommit/RUN_LOCAL_WINDOWS_R5_RECHECK_V2.ps1"
 $TempRunner = Join-Path $env:TEMP 'RUN_LOCAL_WINDOWS_R5_RECHECK_V4_EFFECTIVE.ps1'
 
-$oldTarget = "$CargoTarget = 'C:\n16o'"
-$newTarget = "$CargoTarget = 'C:\n16o51'"
+$oldTarget = '$CargoTarget = ''C:\n16o'''
+$newTarget = '$CargoTarget = ''C:\n16o51'''
 
 $oldMsvcBlock = @'
 Write-Host '[4/7] Verifying MSVC x64 build environment...'
