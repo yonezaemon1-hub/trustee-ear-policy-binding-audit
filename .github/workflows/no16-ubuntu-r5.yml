@@ -1,0 +1,229 @@
+name: No16 Ubuntu R5 replication
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/no16-ubuntu-r5.yml'
+      - 'test_snippet.rs'
+
+permissions:
+  contents: read
+
+env:
+  TRUSTEE_COMMIT: 512fed65642015b849f38fb13bfdec7806639987
+  RUST_TOOLCHAIN: 1.95.0
+  TEST_NAME: test_native_inert_revision_binding
+  EXPECTED_SNIPPET_SHA256: 1e69a6d7d3eaede9bcd9082ea0a01fd9ad01b0894a7d359c995b3416efe9662d
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ubuntu-r5:
+    name: Ubuntu 24.04 exact R5 witness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout evidence repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVIDENCE="${RUNNER_TEMP}/no16-evidence"
+          TRUSTEE="${RUNNER_TEMP}/trustee"
+          mkdir -p "$EVIDENCE"
+          echo "EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          echo "TRUSTEE=$TRUSTEE" >> "$GITHUB_ENV"
+          printf '%s\n' "$GITHUB_SHA" > "$EVIDENCE/evidence_repo_commit.txt"
+          cp .github/workflows/no16-ubuntu-r5.yml "$EVIDENCE/workflow_source.yml"
+          cp test_snippet.rs "$EVIDENCE/test_snippet.rs"
+          sha256sum test_snippet.rs > "$EVIDENCE/test_snippet_sha256.txt"
+          actual="$(sha256sum test_snippet.rs | awk '{print $1}')"
+          test "$actual" = "$EXPECTED_SNIPPET_SHA256"
+
+      - name: Record runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "image_os=ubuntu-24.04"
+            uname -a
+            echo '--- /etc/os-release ---'
+            cat /etc/os-release
+          } > "$EVIDENCE/environment.txt"
+
+      - name: Install Trustee build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev libtss2-dev build-essential pkg-config libssl-dev perl cmake curl gnupg
+          curl --fail --location --retry 3 https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
+            | sudo gpg --dearmor --yes --output /usr/share/keyrings/intel-sgx.gpg
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main' \
+            | sudo tee /etc/apt/sources.list.d/intel-sgx.list
+          sudo apt-get update
+          sudo apt-get install -y libsgx-dcap-quote-verify-dev
+          protoc --version | tee "$EVIDENCE/protoc_version.txt"
+          openssl version -a > "$EVIDENCE/openssl_version.txt"
+          gcc --version > "$EVIDENCE/gcc_version.txt"
+          ld --version > "$EVIDENCE/ld_version.txt"
+          dpkg-query -W protobuf-compiler libprotobuf-dev libtss2-dev libsgx-dcap-quote-verify-dev \
+            > "$EVIDENCE/build_dependency_versions.txt"
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustc +"$RUST_TOOLCHAIN" --version | tee "$EVIDENCE/rustc_version.txt"
+          cargo +"$RUST_TOOLCHAIN" --version | tee "$EVIDENCE/cargo_version.txt"
+          rustup show > "$EVIDENCE/rustup_show.txt"
+          grep -q '^rustc 1\.95\.0 ' "$EVIDENCE/rustc_version.txt"
+          grep -q '^cargo 1\.95\.0 ' "$EVIDENCE/cargo_version.txt"
+
+      - name: Fresh clone pinned Trustee commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'clone_command=git clone --filter=blob:none https://github.com/confidential-containers/trustee.git <fresh-temp-dir>'
+            echo "checkout_command=git checkout --detach $TRUSTEE_COMMIT"
+          } > "$EVIDENCE/provenance.txt"
+          git clone --filter=blob:none https://github.com/confidential-containers/trustee.git "$TRUSTEE"
+          git -C "$TRUSTEE" checkout --detach "$TRUSTEE_COMMIT"
+          head="$(git -C "$TRUSTEE" rev-parse HEAD)"
+          {
+            echo "head=$head"
+            echo "fixed_commit=$TRUSTEE_COMMIT"
+            echo "match=$([[ "$head" = "$TRUSTEE_COMMIT" ]] && echo true || echo false)"
+          } > "$EVIDENCE/commit.txt"
+          test "$head" = "$TRUSTEE_COMMIT"
+          git -C "$TRUSTEE" status --short > "$EVIDENCE/git_status_before.txt"
+          test ! -s "$EVIDENCE/git_status_before.txt"
+
+      - name: Inject exact R5 test only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+
+          checkout = Path(os.environ['TRUSTEE'])
+          broker = checkout / 'attestation-service/src/ear_token/broker.rs'
+          snippet = Path(os.environ['GITHUB_WORKSPACE']) / 'test_snippet.rs'
+          source = broker.read_text(encoding='utf-8')
+          test_name = os.environ['TEST_NAME']
+          if f'fn {test_name}' in source:
+              raise SystemExit('test already present before injection')
+          if not re.search(r'(?s)#\[cfg\(test\)\]\s*mod tests\s*\{.*\}\s*$', source):
+              raise SystemExit('could not locate final tests module')
+          test_body = snippet.read_text(encoding='utf-8')
+          injected = re.sub(r'\}\s*$', '\n' + test_body + '\n}\n', source)
+          broker.write_text(injected, encoding='utf-8', newline='\n')
+          PY
+          broker="$TRUSTEE/attestation-service/src/ear_token/broker.rs"
+          cp "$broker" "$EVIDENCE/patched_broker.rs"
+          git -C "$TRUSTEE" diff -- attestation-service/src/ear_token/broker.rs > "$EVIDENCE/injection.diff"
+          git -C "$TRUSTEE" status --short > "$EVIDENCE/git_status_after.txt"
+          mapfile -t changed < "$EVIDENCE/git_status_after.txt"
+          test "${#changed[@]}" -eq 1
+          [[ "${changed[0]}" == *"attestation-service/src/ear_token/broker.rs"* ]]
+          grep -q "fn $TEST_NAME" "$broker"
+          sha256sum "$broker" > "$EVIDENCE/patched_broker_sha256.txt"
+
+      - name: Run exact native R5 test
+        shell: bash
+        run: |
+          set -euo pipefail
+          command="cargo +$RUST_TOOLCHAIN -vv test --locked -p attestation-service --lib $TEST_NAME -- --nocapture"
+          printf '%s\n' "$command" > "$EVIDENCE/cargo_command.txt"
+          set +e
+          set -o pipefail
+          (
+            cd "$TRUSTEE"
+            cargo +"$RUST_TOOLCHAIN" -vv test --locked -p attestation-service --lib "$TEST_NAME" -- --nocapture
+          ) 2>&1 | tee "$EVIDENCE/cargo_test.log"
+          cargo_status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$cargo_status" > "$EVIDENCE/exit_code.txt"
+          echo "cargo_exit_code=$cargo_status"
+
+      - name: Apply evidence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, re, sys
+
+          e = Path(os.environ['EVIDENCE'])
+          log = (e / 'cargo_test.log').read_text(encoding='utf-8', errors='replace')
+          exit_code = int((e / 'exit_code.txt').read_text().strip())
+          commit = (e / 'commit.txt').read_text()
+          before = (e / 'git_status_before.txt').read_text()
+          after_lines = [x for x in (e / 'git_status_after.txt').read_text().splitlines() if x.strip()]
+          snippet_sha = (e / 'test_snippet_sha256.txt').read_text().split()[0]
+
+          ma = re.search(r'(?m)^sha384_a=([0-9a-f]{96})$', log)
+          mb = re.search(r'(?m)^sha384_b=([0-9a-f]{96})$', log)
+          checks = {
+              'head_matches_fixed_commit': 'match=true' in commit,
+              'clean_before_injection': before == '',
+              'only_broker_changed': len(after_lines) == 1 and 'attestation-service/src/ear_token/broker.rs' in after_lines[0],
+              'exact_r5_snippet_sha256': snippet_sha == os.environ['EXPECTED_SNIPPET_SHA256'],
+              'cargo_exit_zero': exit_code == 0,
+              'target_test_executed_and_ok': f"test ear_token::broker::tests::{os.environ['TEST_NAME']} ... ok" in log,
+              'one_pass_zero_fail': re.search(r'test result: ok\. 1 passed; 0 failed;', log) is not None,
+              'sha384_a_present': ma is not None,
+              'sha384_b_present': mb is not None,
+              'sha384_a_ne_b': ma is not None and mb is not None and ma.group(1) != mb.group(1),
+              'same_logical_policy_identity': 'same_logical_policy_identity=true' in log,
+              'signature_a_verified': 'signature_a_verified=true' in log,
+              'signature_b_verified': 'signature_b_verified=true' in log,
+              'digest_a_absent': 'digest_a_absent_from_both_signed_payloads=true' in log,
+              'digest_b_absent': 'digest_b_absent_from_both_signed_payloads=true' in log,
+              'explicit_policy_hash_paths_a_empty': 'observed_explicit_policy_hash_field_paths_a=[]' in log,
+              'explicit_policy_hash_paths_b_empty': 'observed_explicit_policy_hash_field_paths_b=[]' in log,
+              'temporal_exclusions_exact': 'temporal_exclusions=iat,exp' in log,
+              'normalized_non_temporal_payload_equal': 'normalized_non_temporal_payload_equal=true' in log,
+              'r5_marker': 'PASS_NATIVE_INERT_REVISION_BINDING_TEST' in log,
+          }
+          passed = all(checks.values())
+          (e / 'gate_checks.json').write_text(json.dumps(checks, indent=2, sort_keys=True) + '\n')
+          lines = [f"{k}={str(v).lower()}" for k, v in checks.items()]
+          lines.append(f"final={'PASS' if passed else 'FAIL'}")
+          if passed:
+              lines.append('NO16_GITHUB_ACTIONS_UBUNTU_R5_PASS')
+          (e / 'final_result.txt').write_text('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          if not passed:
+              sys.exit(1)
+          PY
+
+      - name: Build SHA-256 evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$EVIDENCE" ]; then
+            cd "$EVIDENCE"
+            find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          fi
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NO16_UBUNTU24_R5_EVIDENCE
+          path: ${{ env.EVIDENCE }}
+          if-no-files-found: warn
+          retention-days: 90
