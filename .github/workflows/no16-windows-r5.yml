@@ -47,6 +47,12 @@ jobs:
           "TRUSTEE=$trustee" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+          # GITHUB_ENV only affects later steps. Export these immediately as well
+          # because the Python witness extractor runs in this same step.
+          $env:EVIDENCE = $evidence
+          $env:TRUSTEE = $trustee
+          $env:CARGO_TARGET_DIR = $target
+
           $env:GITHUB_SHA | Set-Content -Path (Join-Path $evidence 'evidence_repo_commit.txt') -Encoding ascii
           Copy-Item '.github/workflows/no16-windows-r5.yml' (Join-Path $evidence 'workflow_source.yml')
 
