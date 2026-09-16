@@ -6,7 +6,8 @@ $ErrorActionPreference = 'Stop'
 
 # V4 wraps the immutable V2 runner and applies only environment/audit fixes:
 # 1) use a fresh short target dir so the failed 14.50 partial build is not reused;
-# 2) select an installed MSVC toolset that actually contains lib\spectre\x64;
+# 2) search ALL Visual Studio installs for an MSVC toolset that actually contains
+#    lib\spectre\x64, then select the highest such toolset;
 # 3) force that same toolset in both the verification step and Cargo step;
 # 4) read the clean-before file with utf-8-sig so a PowerShell 5.1 BOM is not
 #    misclassified as a dirty checkout.
@@ -35,35 +36,61 @@ $newMsvcBlock = @'
 Write-Host '[4/7] Verifying Spectre-capable MSVC x64 build environment...'
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found' }
-$vsInstall = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1).Trim()
-if (-not $vsInstall) { throw 'Visual Studio C++ toolchain not found' }
-$vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
-$toolsetsRoot = Join-Path $vsInstall 'VC\Tools\MSVC'
-if (-not (Test-Path $toolsetsRoot)) { throw "MSVC toolsets root not found: $toolsetsRoot" }
 
-$allToolsets = @(Get-ChildItem -Path $toolsetsRoot -Directory | Sort-Object { [version]$_.Name } -Descending)
-$allToolsets.Name | Set-Content -Path (Join-Path $Evidence 'msvc_toolsets_all.txt') -Encoding ASCII
-
-$spectreCandidates = @(
-    $allToolsets | Where-Object {
-        (Test-Path (Join-Path $_.FullName 'bin\Hostx64\x64\cl.exe')) -and
-        (Test-Path (Join-Path $_.FullName 'lib\spectre\x64')) -and
-        (@(Get-ChildItem -Path (Join-Path $_.FullName 'lib\spectre\x64') -Filter '*.lib' -File -ErrorAction SilentlyContinue).Count -gt 0)
-    }
+$vsInstalls = @(
+    & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ }
 )
+if ($vsInstalls.Count -eq 0) { throw 'No Visual Studio installation with C++ x64/x86 tools was found' }
+$vsInstalls | Set-Content -Path (Join-Path $Evidence 'vs_installations_all.txt') -Encoding UTF8
 
-if ($spectreCandidates.Count -eq 0) {
-    throw "No installed MSVC toolset contains x64 Spectre-mitigated libraries under $toolsetsRoot"
+$candidates = @()
+foreach ($install in $vsInstalls) {
+    $root = Join-Path $install 'VC\Tools\MSVC'
+    if (-not (Test-Path $root)) { continue }
+    foreach ($dir in @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue)) {
+        $cl = Join-Path $dir.FullName 'bin\Hostx64\x64\cl.exe'
+        $spectre = Join-Path $dir.FullName 'lib\spectre\x64'
+        $libCount = 0
+        if (Test-Path $spectre) {
+            $libCount = @(Get-ChildItem -Path $spectre -Filter '*.lib' -File -ErrorAction SilentlyContinue).Count
+        }
+        if ((Test-Path $cl) -and $libCount -gt 0) {
+            try { $ver = [version]$dir.Name } catch { continue }
+            $candidates += [pscustomobject]@{
+                Version = $ver
+                VersionText = $dir.Name
+                VsInstall = $install
+                ToolsetDir = $dir.FullName
+                Cl = $cl
+                Spectre = $spectre
+                SpectreLibCount = $libCount
+            }
+        }
+    }
 }
 
-$selected = $spectreCandidates[0]
-$VcToolsVersion = $selected.Name
+if ($candidates.Count -eq 0) {
+    throw 'No installed MSVC toolset with x64 Spectre-mitigated libraries was found in any Visual Studio installation'
+}
+
+$candidates |
+    Sort-Object Version -Descending |
+    ForEach-Object { "$($_.VersionText)`t$($_.VsInstall)`t$($_.Spectre)`tlibs=$($_.SpectreLibCount)" } |
+    Set-Content -Path (Join-Path $Evidence 'msvc_spectre_candidates.txt') -Encoding UTF8
+
+$selected = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+$vsInstall = $selected.VsInstall
+$vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+if (-not (Test-Path $vsDevCmd)) { throw "VsDevCmd.bat not found: $vsDevCmd" }
+$VcToolsVersion = $selected.VersionText
 $verParts = $VcToolsVersion.Split('.')
 if ($verParts.Count -lt 2) { throw "unexpected VCTools version: $VcToolsVersion" }
 $VcVarsVer = "$($verParts[0]).$($verParts[1])"
-$selectedCl = Join-Path $selected.FullName 'bin\Hostx64\x64\cl.exe'
-$spectreLib = Join-Path $selected.FullName 'lib\spectre\x64'
-$spectreLibCount = @(Get-ChildItem -Path $spectreLib -Filter '*.lib' -File).Count
+$selectedCl = $selected.Cl
+$spectreLib = $selected.Spectre
+$spectreLibCount = $selected.SpectreLibCount
 
 $clPathFile = Join-Path $Evidence 'cl_path.txt'
 $vctoolsFile = Join-Path $Evidence 'vctools_env.txt'
@@ -98,6 +125,7 @@ $clInfo = (Get-Item $resolvedCl).VersionInfo
     "product_version=$($clInfo.ProductVersion)"
 ) | Set-Content -Path (Join-Path $Evidence 'cl_version.txt') -Encoding UTF8
 Write-Host "selected_vctools_version=$VcToolsVersion"
+Write-Host "selected_vs_install=$vsInstall"
 Write-Host "spectre_lib_dir=$spectreLib"
 Write-Host "spectre_lib_count=$spectreLibCount"
 '@
